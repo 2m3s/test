@@ -1,0 +1,24 @@
+{
+	"schemaVersion": 1,
+	"id": "routeminer",
+	"version": "${version}",
+	"name": "RouteMiner",
+	"description": "Waypoint route mining macro for Hypixel SkyBlock.",
+	"authors": ["epic6"],
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": ["dev.routeminer.test.TestServer"],
+		"client": ["dev.routeminer.RouteMiner"]
+	},
+	"mixins": [
+		"routeminer.mixins.json",
+		{ "config": "routeminer.client.mixins.json", "environment": "client" }
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

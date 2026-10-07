@@ -1,0 +1,17 @@
+{
+	"required": true,
+	"package": "dev.routeminer.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"WorldOpenFlowsMixin",
+		"MinecraftInvoker",
+		"MultiPlayerGameModeMixin",
+		"MouseHandlerMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
