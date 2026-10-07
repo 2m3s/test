@@ -1,21 +1,20 @@
 plugins {
 	id 'net.fabricmc.fabric-loom' version "${loom_version}"
-	id 'maven-publish'
 }
 
+version = project.mod_version
+group = project.maven_group
+
 repositories {
-	// Add repositories to retrieve artifacts from in here.
-	// You should only use this when depending on other mods because
-	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
-	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
-	// for more information about repositories.
+	// Cloud command framework — GrimAC's Fabric build expects it as a separate mod rather than bundling it.
+	mavenCentral()
 }
 
 loom {
 	splitEnvironmentSourceSets()
 
 	mods {
-		"routeminer" {
+		"testkit" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}
@@ -23,59 +22,245 @@ loom {
 }
 
 dependencies {
-	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-
-	// Fabric API. This is technically optional, but you probably want it anyway.
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// GrimAC persists violations to SQLite and refuses to start without the driver, which its Fabric
+	// build does not bundle. Runtime only: a fixture for the test server, never shipped.
+	runtimeOnly "org.xerial:sqlite-jdbc:${project.sqlite_version}"
+}
+
+// --- the companion server mod ---------------------------------------------------------------------
+//
+// Server-side helper the scenarios drive through commands. It exists because the anticheat server runs
+// as its own process and the harness only reaches it through its console, so anything needing real
+// server-side objects — a genuine ServerPlayer, a chunk-loading fill — has to live over there.
+sourceSets {
+	testmod {
+		compileClasspath += sourceSets.main.compileClasspath
+		runtimeClasspath += sourceSets.main.runtimeClasspath
+	}
+}
+
+tasks.register("testmodJar", Jar) {
+	from sourceSets.testmod.output
+	archiveBaseName = "testkit-server"
+	destinationDirectory = layout.buildDirectory.dir("testmod")
+}
+
+// --- GrimAC ---------------------------------------------------------------------------------------
+//
+// Downloaded on demand into .gradle/grim/ rather than committed: it is a 14 MB third-party binary and
+// pinning it in the repo would be both large and stale. Change grim_version / grim_url to move it.
+def grimJar = file("${rootDir}/.gradle/grim/grimac-fabric-${project.grim_version}.jar")
+
+tasks.register("downloadGrim") {
+	description = "Fetch the GrimAC build the anticheat tests run against."
+	outputs.file(grimJar)
+	doLast {
+		if (!grimJar.exists()) {
+			grimJar.parentFile.mkdirs()
+			logger.lifecycle("Downloading GrimAC ${project.grim_version}")
+			new URI(project.grim_url).toURL().withInputStream { input ->
+				grimJar.withOutputStream { out -> out << input }
+			}
+		}
+	}
+}
+
+// GrimAC must NOT go on the client's classpath, and that is measured rather than preference. A client
+// gametest JVM is EnvType.CLIENT, and there the PacketEvents build Grim bundles installs client-side
+// hooks that are incomplete on 26.1.2: getClientLazyPlayerManagerHolder() returns null and the client's
+// own connection dies with "Invalid player data" the instant it joins. The anticheat belongs in a
+// separate EnvType.SERVER process, which is what prepareTestServer stages.
+def testServerDir = file("${rootDir}/run/testserver")
+
+configurations {
+	testServerMods
+}
+
+dependencies {
+	testServerMods "org.incendo:cloud-fabric:${project.cloud_version}"
+}
+
+tasks.register("prepareTestServer") {
+	description = "Stage a dedicated server with GrimAC and the companion mod installed."
+	dependsOn "downloadGrim", "testmodJar"
+	doLast {
+		def mods = new File(testServerDir, "mods")
+		mods.mkdirs()
+
+		// -Pnogrim has to mean NO ANTICHEAT, not "ignore what it says". With the jar left in place the anticheat
+		// is still installed and still correcting every movement, so a "muted" run measures a watching server
+		// while labelling itself a vanilla one. The jar leaves the folder, and anything left over from an
+		// older Grim pin goes with it; the current one is put back the moment the flag is not passed.
+		mods.listFiles().findAll { it.name.startsWith("grimac-") && it.name != grimJar.name }.each { it.delete() }
+		def grim = new File(mods, grimJar.name)
+		if (project.hasProperty("nogrim")) {
+			if (grim.exists() && grim.delete()) {
+				logger.lifecycle("GrimAC removed from the staged server: -Pnogrim")
+			}
+		} else if (!grim.exists()) {
+			grim.bytes = grimJar.bytes
+		}
+		// Always overwrite the companion mod. Its filename never changes, so an "only if missing" copy
+		// silently keeps serving the first build ever staged — which looks exactly like source changes
+		// having no effect.
+		def testmod = tasks.named("testmodJar").get().archiveFile.get().asFile
+		if (testmod.exists()) {
+			new File(mods, testmod.name).bytes = testmod.bytes
+		}
+		// Cloud drags in fabric-loader and fabric-api pieces; the dev runtime already provides those and
+		// a second copy in mods/ makes loader complain about duplicates.
+		configurations.testServerMods.findAll {
+			it.name.startsWith("cloud-") || it.name.startsWith("geantyref")
+		}.each { dep ->
+			def copy = new File(mods, dep.name)
+			if (!copy.exists()) {
+				copy.bytes = dep.bytes
+			}
+		}
+
+		new File(testServerDir, "eula.txt").text = "eula=true\n"
+		def props = new File(testServerDir, "server.properties")
+		if (!props.exists()) {
+			props.text = [
+				"# Anticheat test server. Local and disposable.",
+				"online-mode=false",
+				// The server's own default is true, written on its first start. Harmless while online-mode is off,
+				// but it is the other half of what a login needs, so it is pinned alongside.
+				"enforce-secure-profile=false",
+				"gamemode=creative",
+				"difficulty=normal",
+				"spawn-protection=0",
+				"max-tick-time=-1",
+				"view-distance=8",
+				"generate-structures=false",
+				"spawn-monsters=false",
+				"motd=Anticheat test server"
+			].join("\n") + "\n"
+		}
+
+		// Send verbose to the console. This is what lets a scenario read check output without the test
+		// player being an operator — and it must not be one, because Grim treats operators as EXEMPT and
+		// an exempt player produces a spotless run for the worst possible reason.
+		def grimConfig = new File(testServerDir, "config/GrimAC/config.yml")
+		if (grimConfig.exists()) {
+			def patched = grimConfig.text.replaceAll(
+				/(?m)^(verbose:\s*\n(?:\s*#.*\n)*\s*print-to-console:\s*)false/, '$1true')
+			if (patched != grimConfig.text) {
+				grimConfig.text = patched
+				logger.lifecycle("GrimAC: verbose print-to-console enabled")
+			}
+		} else {
+			logger.lifecycle("GrimAC config not generated yet — run ./gradlew runTestServer once, then this")
+		}
+		logger.lifecycle("Test server staged at ${testServerDir}")
+	}
+}
+
+loom {
+	runs {
+		testServer {
+			server()
+			configName = "Anticheat Test Server"
+			runDir = "run/testserver"
+		}
+	}
+}
+
+tasks.matching { it.name == "runTestServer" }.configureEach {
+	dependsOn "prepareTestServer"
+}
+
+// The client gametests need the SAME server, started by them so a scenario can bring it up, drive it and
+// tear it down. Rather than reconstruct a dev launch by hand, this records exactly how loom launches
+// runTestServer and lets the test replay it.
+tasks.register("writeTestServerLaunch") {
+	description = "Record how to launch the test server, for the client gametests."
+	dependsOn "prepareTestServer"
+	def launchFile = layout.buildDirectory.file("testserver-launch.properties")
+	outputs.file(launchFile)
+	doLast {
+		def run = tasks.named("runTestServer").get()
+		def props = new Properties()
+		props.setProperty("java", org.gradle.internal.jvm.Jvm.current().javaExecutable.absolutePath)
+		props.setProperty("main", run.mainClass.get())
+		props.setProperty("dir", testServerDir.absolutePath)
+		props.setProperty("classpath", run.classpath.files.collect { it.absolutePath }.join(File.pathSeparator))
+		// Loom supplies the dev-launch flags through argument PROVIDERS, not plain jvmArgs. Dropping them
+		// starts a server that dies before printing anything, which reads as a server that is merely slow.
+		def jvm = new ArrayList<String>(run.jvmArgs)
+		run.jvmArgumentProviders.each { jvm.addAll(it.asArguments()) }
+		// Joined with NUL, which TestServer.split() splits on, and not a space: on Windows loom passes the
+		// dev-launch flags in an @argfile whose path can contain spaces, and a space-joined list comes back as
+		// the wrong arguments -- a server that exits before printing anything. Written as the escape rather
+		// than the character itself: a literal NUL makes git treat this whole file as binary, so it has no
+		// diffs and no history anyone can read.
+		props.setProperty("jvmArgs", jvm.join("\u0000"))
+		props.setProperty("args", run.args.join("\u0000"))
+		def out = launchFile.get().asFile
+		out.parentFile.mkdirs()
+		out.withOutputStream { props.store(it, "Launch spec for the anticheat test server") }
+	}
+}
+
+fabricApi {
+	configureTests {
+		createSourceSet = true
+		modId = "testkit-gametest"
+	}
+}
+
+dependencies {
+	gametestImplementation sourceSets.client.output
+}
+
+def failedFile = layout.buildDirectory.file("gametest-failed.txt").get().asFile
+
+tasks.matching { it.name == "runClientGameTest" }.configureEach {
+	dependsOn "writeTestServerLaunch"
+	systemProperty "testkit.testserver.launch",
+			layout.buildDirectory.file("testserver-launch.properties").get().asFile.absolutePath
+	// A failing test no longer ends the run (dev.testkit.harness.SuiteVerdict): the run carries on and writes
+	// the names of what failed here, for -Pfailed to read back.
+	systemProperty "testkit.failedFile", failedFile.absolutePath
+	// Run one scenario:  -Pscenario=my-thing   or several, in one launch:  -Pscenario=my-thing,other-thing
+	if (project.hasProperty("scenario")) {
+		systemProperty "testkit.scenario", project.property("scenario")
+	}
+	// Re-run only what failed last time:  -Pfailed
+	if (project.hasProperty("failed")) {
+		if (!failedFile.exists() || failedFile.text.trim().isEmpty()) {
+			throw new GradleException("-Pfailed: nothing failed last run (no ${failedFile})")
+		}
+		systemProperty "testkit.scenario", failedFile.text.trim()
+	}
+	// Run the bodies on a server with no anticheat at all, to separate "my module is broken" from "Grim
+	// objects". prepareTestServer takes the jar out of the staged server for this run.
+	if (project.hasProperty("nogrim")) {
+		systemProperty "testkit.nogrim", "true"
+	}
+	// Point a scenario that benches on a saved world at a different save:  -Pworld=<folder under run/saves>
+	if (project.hasProperty("world")) {
+		systemProperty "testkit.world", project.property("world")
+	}
 }
 
 processResources {
-	def version = project.version
-	inputs.property "version", version
-
+	inputs.property "version", project.version
 	filesMatching("fabric.mod.json") {
-		expand "version": version
+		expand "version": project.version
 	}
 }
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25
+	it.options.encoding = "UTF-8"
 }
 
 java {
-	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
-	// if it is present.
-	// If you remove this line, sources will not be generated.
-	withSourcesJar()
-
 	sourceCompatibility = JavaVersion.VERSION_25
 	targetCompatibility = JavaVersion.VERSION_25
-}
-
-jar {
-	def projectName = project.name
-	inputs.property "projectName", projectName
-
-	from("LICENSE") {
-		rename { "${it}_$projectName"}
-	}
-}
-
-// configure the maven publication
-publishing {
-	publications {
-		create("mavenJava", MavenPublication) {
-			from components.java
-		}
-	}
-
-	// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
-	repositories {
-		// Add repositories to publish to here.
-		// Notice: This block does NOT have the same function as the block in the top level.
-		// The repositories here will be used for publishing your artifact, not for
-		// retrieving dependencies.
-	}
 }

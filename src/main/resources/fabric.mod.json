@@ -1,24 +1,17 @@
 {
 	"schemaVersion": 1,
-	"id": "routeminer",
+	"id": "testkit",
 	"version": "${version}",
-	"name": "RouteMiner",
-	"description": "Waypoint route mining macro for Hypixel SkyBlock.",
-	"authors": ["epic6"],
+	"name": "Anticheat Test Kit",
+	"description": "Client-side harness for testing Minecraft client mods against a real anticheat.",
 	"license": "MIT",
-	"environment": "*",
-	"entrypoints": {
-		"main": ["dev.routeminer.test.TestServer"],
-		"client": ["dev.routeminer.RouteMiner"]
-	},
+	"environment": "client",
 	"mixins": [
-		"routeminer.mixins.json",
-		{ "config": "routeminer.client.mixins.json", "environment": "client" }
+		{ "config": "testkit.client.mixins.json", "environment": "client" }
 	],
 	"depends": {
-		"fabricloader": ">=0.19.5",
-		"minecraft": "~26.3",
-		"java": ">=25",
-		"fabric-api": "*"
+		"fabricloader": ">=0.16",
+		"minecraft": ">=26.1.2 <26.3",
+		"java": ">=21"
 	}
 }

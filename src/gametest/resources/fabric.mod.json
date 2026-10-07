@@ -1,0 +1,22 @@
+{
+	"schemaVersion": 1,
+	"id": "testkit-gametest",
+	"version": "1.0.0",
+	"name": "Anticheat Test Kit — scenarios",
+	"environment": "client",
+	"entrypoints": {
+		"fabric-client-gametest": [
+			"dev.testkit.gametest.SmokeTest",
+			"dev.testkit.gametest.ProofTest",
+			"dev.testkit.gametest.SeedWorldTest",
+			"dev.testkit.gametest.ExampleTest",
+			"dev.testkit.gametest.MovementExamples",
+			"dev.testkit.gametest.CombatExamples",
+			"dev.testkit.gametest.PlacementExamples"
+		]
+	},
+	"depends": {
+		"testkit": "*",
+		"fabric-client-gametest-api-v1": "*"
+	}
+}
